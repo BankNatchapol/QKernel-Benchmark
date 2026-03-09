@@ -181,7 +181,7 @@ if __name__ == "__main__":
 
     # Load ad_hoc dataset
     X_train, X_test, y_train, y_test = load_dataset(
-        name="breast_cancer",
+        name="ad_hoc",
         n_samples=200,
         n_features=2,   # use 2 so it can be plotted directly
         test_size=0.2,

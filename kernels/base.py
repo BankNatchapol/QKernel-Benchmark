@@ -1,3 +1,8 @@
+"""
+Checked by Bank
+2026-03-09
+"""
+
 """Abstract base class for quantum kernels."""
 
 from abc import ABC, abstractmethod

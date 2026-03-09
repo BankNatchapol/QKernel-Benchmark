@@ -1,4 +1,9 @@
 """
+Check by Bank
+2025-03-09
+"""
+
+"""
 BenchmarkRunner: orchestrates the full benchmark grid.
 
 Runs every combination of (kernel × dataset), fits the classifier,

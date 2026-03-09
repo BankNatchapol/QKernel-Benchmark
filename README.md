@@ -92,22 +92,22 @@ QKernel-Benchmark/
 │   ├── zz_map.py [✓]             ← ZZ-FeatureMap
 │   └── rx_map.py [✓]             ← Rx angle encoding
 ├── kernels/
-│   ├── base.py [ ]               ← Abstract QuantumKernel
-│   ├── fidelity_kernel.py [ ]    ← FQK
-│   ├── projected_kernel.py [ ]   ← PQK
-│   ├── trainable_kernel.py [ ]   ← QKTA
-│   └── qflair_kernel.py [ ]      ← Q-FLAIR
+│   ├── base.py [✓]               ← Abstract QuantumKernel
+│   ├── fidelity_kernel.py [✓]    ← FQK
+│   ├── projected_kernel.py [✓]   ← PQK
+│   ├── trainable_kernel.py [✓]   ← QKTA
+│   └── qflair_kernel.py [✓]      ← Q-FLAIR
 ├── classifiers/
 │   ├── qsvm.py [✓]               ← Quantum SVM
 │   └── qkrr.py [ ]               ← Quantum KRR
 ├── datasets/
 │   └── loader.py [✓]             ← Unified dataset loader
 ├── benchmark/
-│   ├── metrics.py [ ]            ← ML + resource metrics + ROC plots
-│   └── runner.py [ ]             ← BenchmarkRunner
+│   ├── metrics.py [✓]            ← ML + resource metrics + ROC plots
+│   └── runner.py [✓]             ← BenchmarkRunner
 ├── experiments/
-│   ├── run_single.py [ ]
-│   └── run_all.py [ ]
+│   ├── run_single.py [✓]
+│   └── run_all.py [✓]
 └── tests/
     ├── test_kernels.py [ ]
     ├── test_datasets.py [ ]
