@@ -38,10 +38,12 @@ class QuantumKernel(ABC):
     ``build_kernel_matrix``.
     """
 
-    def __init__(self, n_qubits: int, shots: int = 1024, seed: int = 42):
+    def __init__(self, n_qubits: int, shots: int = 1024, seed: int = 42, chunk_size: int = 4096, backend_name: str = "aer"):
         self.n_qubits = n_qubits
         self.shots = shots
         self.seed = seed
+        self.chunk_size = chunk_size
+        self.backend_name = backend_name
         self.stats = ResourceStats(n_qubits=n_qubits)
 
     def _reset_stats(self) -> None:
@@ -57,6 +59,15 @@ class QuantumKernel(ABC):
         If Y is None the kernel is evaluated as K[i,j] = k(X[i], X[j]) (square).
         """
         ...
+
+    def _project_to_psd(self, K: np.ndarray) -> np.ndarray:
+        """Project a symmetric matrix to the nearest PSD matrix by clipping eigenvalues."""
+        K = 0.5 * (K + K.T)
+        eigvals, eigvecs = np.linalg.eigh(K)
+        eigvals_clipped = np.clip(eigvals, 0.0, None)
+        K_psd = eigvecs @ np.diag(eigvals_clipped) @ eigvecs.T
+        K_psd = 0.5 * (K_psd + K_psd.T)
+        return K_psd
 
     def __repr__(self) -> str:
         return (

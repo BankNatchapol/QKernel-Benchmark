@@ -113,7 +113,7 @@ def test_qflair_learned_architecture(small_data):
     X, y = small_data
     kernel = QFLAIRKernel(n_qubits=N_QUBITS, shots=SHOTS, seed=SEED, n_layers=2)
     kernel.fit(X, y)
-    assert len(kernel._gate_sequence) > 0, "Q-FLAIR should learn at least one gate"
+    assert len(kernel.learned_gates) > 0, "Q-FLAIR should learn at least one gate"
 
 
 # -----------------------------------------------------------------------

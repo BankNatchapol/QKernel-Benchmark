@@ -1,9 +1,9 @@
+from __future__ import annotations
+
 """
 Check by Bank
 2025-03-09
-"""
 
-"""
 Benchmark metrics and ROC/AUC plotting.
 
 Provides:
@@ -12,8 +12,6 @@ Provides:
   - ``plot_roc_curve``       — single ROC curve on a matplotlib Axes.
   - ``plot_all_roc_curves``  — overlay all kernels' ROC curves and save.
 """
-
-from __future__ import annotations
 
 import time
 from contextlib import contextmanager

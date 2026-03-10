@@ -32,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_samples", type=int, default=60)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--results_dir", default="results")
+    parser.add_argument("--chunk_size", type=int, default=4096)
+    parser.add_argument("--backend_name", choices=["aer", "statevector"], default="aer")
     parser.add_argument(
         "--datasets",
         nargs="+",
@@ -41,18 +43,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_kernels(n_qubits: int, shots: int, seed: int) -> dict:
+def build_kernels(n_qubits: int, shots: int, seed: int, chunk_size: int, backend_name: str) -> dict:
     return {
-        "FQK":    FidelityKernel(n_qubits=n_qubits, shots=shots, seed=seed),
-        "PQK":    ProjectedKernel(n_qubits=n_qubits, shots=shots, seed=seed),
-        "QKTA":   TrainableKernel(n_qubits=n_qubits, shots=shots, seed=seed, max_iter=30),
-        "Q-FLAIR": QFLAIRKernel(n_qubits=n_qubits, shots=shots, seed=seed, n_layers=3),
+        "FQK":    FidelityKernel(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name),
+        "PQK":    ProjectedKernel(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name),
+        "QKTA":   TrainableKernel(n_qubits=n_qubits, shots=shots, seed=seed, max_iter=30, chunk_size=chunk_size, backend_name=backend_name),
+        "Q-FLAIR": QFLAIRKernel(n_qubits=n_qubits, shots=shots, seed=seed, n_layers=3, chunk_size=chunk_size, backend_name=backend_name),
     }
 
 
 def main() -> None:
     args = parse_args()
-    kernels = build_kernels(args.n_qubits, args.shots, args.seed)
+    kernels = build_kernels(args.n_qubits, args.shots, args.seed, args.chunk_size, args.backend_name)
 
     runner = BenchmarkRunner(
         kernels=kernels,

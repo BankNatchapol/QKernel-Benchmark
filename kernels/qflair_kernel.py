@@ -318,8 +318,10 @@ class QFLAIRKernel(QuantumKernel):
         min_gain: float = 1e-4,
         clip_reconstructed_kernel: bool = False,
         optimize_scalar_method: str = "bounded",
+        chunk_size: int = 4096,
+        backend_name: str = "aer",
     ):
-        super().__init__(n_qubits=n_qubits, shots=shots, seed=seed)
+        super().__init__(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name)
 
         self.n_layers = int(n_layers)
         self.alpha0 = float(alpha0)
@@ -515,27 +517,54 @@ class QFLAIRKernel(QuantumKernel):
     def _run_overlap_batch(
         self,
         circuits: list[QuantumCircuit],
+        show_progress: bool = False,
     ) -> list[float]:
         """
-        Execute overlap circuits and return the all-zero probabilities.
+        Execute overlap circuits in chunks and return the all-zero probabilities.
         """
         if not circuits:
             return []
 
-        t_circuits = transpile(
-            circuits,
-            self._backend,
-            optimization_level=0,
-            seed_transpiler=self.seed,
-        )
-        job = self._backend.run(t_circuits, shots=self.shots)
-        counts_list = job.result().get_counts()
+        chunk_size = 4096
+        results_vals: list[float] = []
 
-        if not isinstance(counts_list, list):
-            counts_list = [counts_list]
+        # Setup optional progress bar
+        pbar_total = len(circuits)
+        pbar = None
+        if show_progress:
+            from tqdm import tqdm
+            pbar = tqdm(total=pbar_total, desc="  QFLAIR matrix", unit="circ", ncols=88, leave=False)
 
-        zero_key = "0" * self.n_qubits
-        return [count.get(zero_key, 0) / self.shots for count in counts_list]
+        for i in range(0, pbar_total, chunk_size):
+            chunk = circuits[i : i + chunk_size]
+
+            if pbar is not None:
+                pbar.set_postfix_str("simulating...", refresh=True)
+
+            t_chunk = transpile(
+                chunk,
+                self._backend,
+                optimization_level=0,
+                seed_transpiler=self.seed,
+            )
+            job = self._backend.run(t_chunk, shots=self.shots)
+            counts_list = job.result().get_counts()
+
+            if not isinstance(counts_list, list):
+                counts_list = [counts_list]
+
+            zero_key = "0" * self.n_qubits
+            for count in counts_list:
+                results_vals.append(count.get(zero_key, 0) / self.shots)
+
+            if pbar is not None:
+                pbar.update(len(chunk))
+                pbar.set_postfix_str("", refresh=True)
+
+        if pbar is not None:
+            pbar.close()
+
+        return results_vals
 
     # -------------------------------------------------------------------------
     # Kernel / KTA helpers
@@ -548,12 +577,27 @@ class QFLAIRKernel(QuantumKernel):
     ) -> np.ndarray:
         """
         Build the exact sampled fidelity kernel matrix for a fixed learned map.
-
-        "Exact" here means exact with respect to the currently chosen circuit,
-        but still estimated by shot-based overlap circuits.
         """
         n = len(X)
         K = np.eye(n, dtype=float)
+        
+        if self.backend_name == "statevector":
+            from qiskit.quantum_info import Statevector
+            
+            sv_list = []
+            for i in range(n):
+                qc = self._build_feature_map(X[i], learned_gates)
+                sv_list.append(Statevector(qc).data)
+            
+            V = np.array(sv_list)
+            K_exact = np.abs(V.conj() @ V.T)**2
+            K_exact = np.clip(K_exact, 0.0, 1.0)
+            
+            # Apply shot noise
+            rng = np.random.default_rng(self.seed + len(learned_gates))
+            K = rng.binomial(self.shots, K_exact) / self.shots
+            np.fill_diagonal(K, 1.0)
+            return K
 
         circuits: list[QuantumCircuit] = []
         indices: list[tuple[int, int]] = []
@@ -629,43 +673,96 @@ class QFLAIRKernel(QuantumKernel):
         X: np.ndarray,
         learned_gates: list[LearnedGate],
         candidate: GateCandidate,
+        V_0_list: list["qiskit.quantum_info.Statevector"] | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        For one candidate gate, reconstruct the pairwise kernel coefficients
-        a_ij, b_ij, c_ij for all training pairs (i, j).
-
-        The three probe angles are:
-            alpha0
-            alpha0 + pi/2
-            alpha0 - pi/2
-        """
         n = len(X)
         alpha0 = self.alpha0
         probe_alphas = [alpha0, alpha0 + np.pi / 2.0, alpha0 - np.pi / 2.0]
 
         value_maps: list[np.ndarray] = []
 
-        for alpha in probe_alphas:
-            circuits: list[QuantumCircuit] = []
-            indices: list[tuple[int, int]] = []
+        if self.backend_name == "statevector":
+            V_0_data = np.array([sv.data for sv in V_0_list])
+            V_0_conj = V_0_data.conj()
+            
+            V_reshaped = V_0_data.reshape([n] + [2] * self.n_qubits)
+            letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            sub_v = letters[0] + "".join(letters[1 : self.n_qubits + 1])
+            idx = list(letters[1 : self.n_qubits + 1])
+            
+            for alpha in probe_alphas:
+                qc_cand = QuantumCircuit(self.n_qubits)
+                _apply_weight_data_gate(qc_cand, candidate, np.zeros(self.n_qubits), alpha_override=alpha)
+                
+                if len(qc_cand.data) == 0:
+                    V_alpha_data = V_0_data
+                else:
+                    op = qc_cand.data[0].operation
+                    qubits = [qc_cand.find_bit(q).index for q in qc_cand.data[0].qubits]
+                    gate_mat = op.to_matrix()
+                    
+                    if len(qubits) == 1:
+                        q0 = self.n_qubits - qubits[0] - 1
+                        in0 = idx[q0]
+                        out0 = letters[self.n_qubits + 1]
+                        sub_g = out0 + in0
+                        idx_out = list(idx)
+                        idx_out[q0] = out0
+                        sub_out = letters[0] + "".join(idx_out)
+                        eq = f"{sub_g},{sub_v}->{sub_out}"
+                        V_alpha_data = np.einsum(eq, gate_mat, V_reshaped).reshape(n, -1)
+                    else:
+                        q0 = self.n_qubits - qubits[0] - 1
+                        q1 = self.n_qubits - qubits[1] - 1
+                        in0 = idx[q0]
+                        in1 = idx[q1]
+                        out0 = letters[self.n_qubits + 1]
+                        out1 = letters[self.n_qubits + 2]
+                        sub_g = out1 + out0 + in1 + in0
+                        idx_out = list(idx)
+                        idx_out[q0] = out0
+                        idx_out[q1] = out1
+                        sub_out = letters[0] + "".join(idx_out)
+                        eq = f"{sub_g},{sub_v}->{sub_out}"
+                        gate_mat_reshaped = gate_mat.reshape(2, 2, 2, 2)
+                        V_alpha_data = np.einsum(eq, gate_mat_reshaped, V_reshaped).reshape(n, -1)
+                
+                K_eval = np.abs(V_alpha_data @ V_0_conj.T)**2
+                K_eval = np.clip(K_eval, 0.0, 1.0)
+                
+                M_exact = np.zeros((n, n), dtype=float)
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        M_exact[i, j] = K_eval[i, j]
+                        M_exact[j, i] = K_eval[i, j]
+                np.fill_diagonal(M_exact, 1.0)
+                
+                sv_seed = abs(hash((self.seed, len(learned_gates), alpha))) % (2**31 - 1)
+                rng = np.random.default_rng(sv_seed)
+                M = rng.binomial(self.shots, M_exact) / self.shots
+                value_maps.append(M)
+        else:
+            for alpha in probe_alphas:
+                circuits: list[QuantumCircuit] = []
+                indices: list[tuple[int, int]] = []
 
-            for i in range(n):
-                for j in range(i + 1, n):
-                    circuits.append(
-                        self._build_reconstruction_overlap_circuit(
-                            X[i], X[j], learned_gates, candidate, alpha
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        circuits.append(
+                            self._build_reconstruction_overlap_circuit(
+                                X[i], X[j], learned_gates, candidate, alpha
+                            )
                         )
-                    )
-                    indices.append((i, j))
+                        indices.append((i, j))
 
-            vals = self._run_overlap_batch(circuits)
+                vals = self._run_overlap_batch(circuits)
 
-            M = np.eye(n, dtype=float)
-            for val, (i, j) in zip(vals, indices):
-                M[i, j] = val
-                M[j, i] = val
+                M = np.eye(n, dtype=float)
+                for val, (i, j) in zip(vals, indices):
+                    M[i, j] = val
+                    M[j, i] = val
 
-            value_maps.append(M)
+                value_maps.append(M)
 
         a, b, c = self._reconstruct_cosine_coeffs(
             value_maps[0],
@@ -674,7 +771,6 @@ class QFLAIRKernel(QuantumKernel):
             alpha0,
         )
 
-        # Enforce exact diagonal fidelity for the surrogate.
         np.fill_diagonal(a, 0.0)
         np.fill_diagonal(b, 0.0)
         np.fill_diagonal(c, 1.0)
@@ -721,54 +817,44 @@ class QFLAIRKernel(QuantumKernel):
         a: np.ndarray,
         b: np.ndarray,
         c: np.ndarray,
-        X: np.ndarray,
+        diff: np.ndarray,
+        T: np.ndarray,
+        T_norm: float,
         y: np.ndarray,
-        feature_idx: int,
     ) -> tuple[float, float]:
         """
-        Optimize the scalar weight for one chosen feature using the
-        reconstructed surrogate KTA.
-
-        Returns
-        -------
-        weight_star:
-            Best scalar weight.
-        kta_star:
-            Best surrogate KTA at that weight.
+        Optimise the scalar weight for one feature using the reconstructed
+        surrogate KTA. Uses a coarse 8-point scan then bounded refinement.
+        Memory: O(n²) — no large grid tensor is allocated.
         """
-        def objective(weight: float) -> float:
-            K_rec = self._reconstructed_kernel_from_feature_weight(
-                a=a,
-                b=b,
-                c=c,
-                X=X,
-                feature_idx=feature_idx,
-                weight=float(weight),
-            )
-            return -self._kta(K_rec, y)
-
-        method = self.optimize_scalar_method.lower()
-        if method == "bounded":
-            result = minimize_scalar(
-                objective,
-                bounds=self.weight_bounds,
-                method="bounded",
-                options={"maxiter": self.weight_opt_maxiter},
-            )
-        else:
-            # Fallback: still honor bounds through clipping inside the objective.
-            result = minimize_scalar(
-                objective,
-                method=method,
-                options={"maxiter": self.weight_opt_maxiter},
-            )
-
-        weight_star = float(result.x)
-        # Ensure weight is kept inside the stated bounds
         low, high = self.weight_bounds
-        weight_star = float(np.clip(weight_star, low, high))
-        kta_star = -float(objective(weight_star))
 
+        def _kta_w(w: float) -> float:
+            α = float(w) * diff
+            K = a * np.cos(α - b) + c
+            K = 0.5 * (K + K.T)
+            np.fill_diagonal(K, 1.0)
+            num = float(np.sum(K * T))
+            denom = float(np.sqrt(np.sum(K * K) * T_norm) + 1e-12)
+            return num / denom
+
+        # Coarse 8-point scan to find best bracket
+        grid = np.linspace(low, high, 8)
+        best_w = grid[int(np.argmax([_kta_w(g) for g in grid]))]
+
+        # Fine bounded refinement in narrow window around best grid point
+        margin = (high - low) / 8
+        lo_r = max(low, best_w - margin)
+        hi_r = min(high, best_w + margin)
+
+        result = minimize_scalar(
+            lambda w: -_kta_w(w),
+            bounds=(lo_r, hi_r),
+            method="bounded",
+            options={"maxiter": self.weight_opt_maxiter},
+        )
+        weight_star = float(np.clip(result.x, low, high))
+        kta_star = _kta_w(weight_star)
         return weight_star, kta_star
 
     # -------------------------------------------------------------------------
@@ -806,29 +892,58 @@ class QFLAIRKernel(QuantumKernel):
             desc="  QFLAIR fit",
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
             ncols=88,
+            position=1,
             leave=False,
         ) as pbar:
             for _layer in range(self.n_layers):
                 best_choice: tuple[GateCandidate, int, float] | None = None
                 best_surrogate_kta = -np.inf
     
+                V_0_list = None
+                if self.backend_name == "statevector":
+                    from qiskit.quantum_info import Statevector
+                    svs = []
+                    for i in tqdm(range(len(X)), desc="  → encoding", unit="sv", ncols=88, position=2, leave=False):
+                        qc = self._build_feature_map(X[i], learned)
+                        svs.append(Statevector(qc))
+                    V_0_list = svs
+    
+                # Precompute T and T_norm once per layer, and diffs once per feature
+                T = np.outer(y, y)
+                T_norm = float(np.sum(T * T))
+                diffs = [
+                    X[:, k][:, None] - X[:, k][None, :]
+                    for k in range(n_features)
+                ]
+    
                 # Search candidate gate, feature, and weight.
-                for candidate in self.candidate_pool:
-                    a, b, c = self._candidate_reconstruction(X, learned, candidate)
+                cand_bar = tqdm(
+                    self.candidate_pool,
+                    desc="  → candidates",
+                    unit="cand",
+                    ncols=88,
+                    position=2,
+                    leave=False,
+                )
+                for candidate in cand_bar:
+                    cand_bar.set_postfix_str(f"{candidate.name}{list(candidate.wires)}", refresh=True)
+                    a, b, c = self._candidate_reconstruction(X, learned, candidate, V_0_list)
     
                     for feature_idx in range(n_features):
                         weight_star, surrogate_kta = self._optimize_weight_for_feature(
                             a=a,
                             b=b,
                             c=c,
-                            X=X,
+                            diff=diffs[feature_idx],
+                            T=T,
+                            T_norm=T_norm,
                             y=y,
-                            feature_idx=feature_idx,
                         )
     
                         if surrogate_kta > best_surrogate_kta:
                             best_surrogate_kta = surrogate_kta
                             best_choice = (candidate, feature_idx, weight_star)
+                cand_bar.close()
     
                 if best_choice is None:
                     break
@@ -873,9 +988,6 @@ class QFLAIRKernel(QuantumKernel):
     ) -> np.ndarray:
         """
         Build the final sampled fidelity kernel matrix from the learned map.
-
-        If Y is None, returns a symmetric n x n matrix.
-        Otherwise returns an n x m cross-kernel matrix.
         """
         self._reset_stats()
         t0 = time.perf_counter()
@@ -885,6 +997,58 @@ class QFLAIRKernel(QuantumKernel):
         Y = X if Y is None else Y
 
         n, m = len(X), len(Y)
+
+        if self.backend_name == "statevector":
+            K = self._build_kernel_matrix_sv(X, Y, symmetric, n, m)
+        else:
+            K = self._build_kernel_matrix_aer(X, Y, symmetric, n, m)
+
+        self.stats.wall_clock_seconds = time.perf_counter() - t0
+        return K
+
+    def _build_kernel_matrix_sv(
+        self, X: np.ndarray, Y: np.ndarray, symmetric: bool, n: int, m: int
+    ) -> np.ndarray:
+        from tqdm import tqdm
+        from qiskit.quantum_info import Statevector
+
+        example_qc = self._build_feature_map(X[0], self._learned_gates)
+        res = analyze_circuit_resources(example_qc)
+        self.stats.total_depth = res["total_depth"]
+        self.stats.two_qubit_depth = res["two_qubit_depth"]
+        self.stats.total_gates = res["total_gates"]
+        self.stats.two_qubit_count = res["two_qubit_count"]
+        self.stats.one_qubit_count = res["one_qubit_count"]
+        self.stats.gate_breakdown = res["gate_breakdown"]
+
+        total_pairs = (n * (n + 1)) // 2 if symmetric else n * m
+        self.stats.total_shots = total_pairs * self.shots
+        self.stats.n_evaluations = total_pairs
+
+        def encode_dist(data: np.ndarray, desc: str) -> np.ndarray:
+            svs = []
+            for i in tqdm(range(len(data)), desc=desc, unit="sv", ncols=88, leave=False):
+                qc = self._build_feature_map(data[i], self._learned_gates)
+                svs.append(Statevector(qc).data)
+            return np.array(svs)
+
+        V_x = encode_dist(X, "  QFLAIR SV (X)")
+        V_y = V_x if symmetric else encode_dist(Y, "  QFLAIR SV (Y)")
+
+        K_exact = np.abs(V_x.conj() @ V_y.T)**2
+        K_exact = np.clip(K_exact, 0.0, 1.0)
+
+        rng = np.random.default_rng(self.seed)
+        K = rng.binomial(self.shots, K_exact) / self.shots
+
+        if symmetric:
+            np.fill_diagonal(K, 1.0)
+
+        return K
+
+    def _build_kernel_matrix_aer(
+        self, X: np.ndarray, Y: np.ndarray, symmetric: bool, n: int, m: int
+    ) -> np.ndarray:
         K = np.zeros((n, m), dtype=float)
 
         circuits: list[QuantumCircuit] = []
@@ -906,7 +1070,6 @@ class QFLAIRKernel(QuantumKernel):
             self.stats.total_shots = self.shots * len(circuits)
             self.stats.n_evaluations = len(circuits)
 
-            # Resource stats from one representative overlap circuit
             res = analyze_circuit_resources(circuits[0])
             self.stats.total_depth = res["total_depth"]
             self.stats.two_qubit_depth = res["two_qubit_depth"]
@@ -915,7 +1078,7 @@ class QFLAIRKernel(QuantumKernel):
             self.stats.one_qubit_count = res["one_qubit_count"]
             self.stats.gate_breakdown = res["gate_breakdown"]
 
-            vals = self._run_overlap_batch(circuits)
+            vals = self._run_overlap_batch(circuits, show_progress=True)
             for val, (i, j) in zip(vals, indices):
                 K[i, j] = val
                 if symmetric:
@@ -925,9 +1088,7 @@ class QFLAIRKernel(QuantumKernel):
             self.stats.n_evaluations = 0
 
             if n > 0 and m > 0:
-                example = self._build_overlap_circuit(
-                    X[0], Y[0], self._learned_gates
-                )
+                example = self._build_feature_map(X[0], self._learned_gates)
                 res = analyze_circuit_resources(example)
                 self.stats.total_depth = res["total_depth"]
                 self.stats.two_qubit_depth = res["two_qubit_depth"]
@@ -936,7 +1097,6 @@ class QFLAIRKernel(QuantumKernel):
                 self.stats.one_qubit_count = res["one_qubit_count"]
                 self.stats.gate_breakdown = res["gate_breakdown"]
 
-        self.stats.wall_clock_seconds = time.perf_counter() - t0
         return K
 
     # -------------------------------------------------------------------------
@@ -973,6 +1133,9 @@ if __name__ == "__main__":
         test_size=0.25,
         random_state=42,
     )
+
+    X_train = X_train[:, :2]
+    X_test = X_test[:, :2]
 
     print("X_train shape:", X_train.shape)
     print("X_test shape :", X_test.shape)

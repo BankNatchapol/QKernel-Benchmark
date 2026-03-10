@@ -30,10 +30,10 @@ from benchmark.runner import BenchmarkRunner
 
 
 KERNEL_REGISTRY = {
-    "fqk": lambda n_qubits, shots, seed: FidelityKernel(n_qubits=n_qubits, shots=shots, seed=seed),
-    "pqk": lambda n_qubits, shots, seed: ProjectedKernel(n_qubits=n_qubits, shots=shots, seed=seed),
-    "qkta": lambda n_qubits, shots, seed: TrainableKernel(n_qubits=n_qubits, shots=shots, seed=seed),
-    "qflair": lambda n_qubits, shots, seed: QFLAIRKernel(n_qubits=n_qubits, shots=shots, seed=seed),
+    "fqk": lambda n_qubits, shots, seed, chunk_size, backend_name: FidelityKernel(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name),
+    "pqk": lambda n_qubits, shots, seed, chunk_size, backend_name: ProjectedKernel(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name),
+    "qkta": lambda n_qubits, shots, seed, chunk_size, backend_name: TrainableKernel(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name),
+    "qflair": lambda n_qubits, shots, seed, chunk_size, backend_name: QFLAIRKernel(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name),
 }
 
 
@@ -56,6 +56,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shots", type=int, default=1024, help="Shots per circuit.")
     parser.add_argument("--n_samples", type=int, default=80, help="Total dataset size.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument("--chunk_size", type=int, default=4096, help="Circuits per batch for memory-safe simulation.")
+    parser.add_argument("--backend_name", choices=["aer", "statevector"], default="aer", help="Backend to use (aer or statevector).")
     parser.add_argument(
         "--results_dir", default="results", help="Directory for output files."
     )
@@ -65,7 +67,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    kernel = KERNEL_REGISTRY[args.kernel](args.n_qubits, args.shots, args.seed)
+    kernel = KERNEL_REGISTRY[args.kernel](args.n_qubits, args.shots, args.seed, args.chunk_size, args.backend_name)
 
     runner = BenchmarkRunner(
         kernels={args.kernel: kernel},

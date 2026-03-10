@@ -73,10 +73,14 @@ class TrainableKernel(QuantumKernel):
         shots: int = 1024,
         seed: int = 42,
         max_iter: int = 50,
+        enforce_psd: bool = True,
+        chunk_size: int = 4096,
+        backend_name: str = "aer",
     ):
-        super().__init__(n_qubits=n_qubits, shots=shots, seed=seed)
+        super().__init__(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name)
         self.reps = reps
         self.max_iter = max_iter
+        self.enforce_psd = enforce_psd
         self._n_params = n_qubits * reps
         self._theta = np.zeros(self._n_params, dtype=float)
         self._backend = AerSimulator(seed_simulator=seed)
@@ -123,12 +127,49 @@ class TrainableKernel(QuantumKernel):
         return qc
 
     def _build_K(self, X: np.ndarray, theta: np.ndarray) -> np.ndarray:
-        """Build the symmetric training kernel matrix K_theta(X, X)."""
+        """Build the symmetric training kernel matrix K_theta(X, X) safely."""
         n = len(X)
+        
+        if self.backend_name == "statevector":
+            from qiskit.quantum_info import Statevector
+            
+            sv_list = []
+            for i in range(n):
+                qc = _build_trainable_circuit(X[i], theta, self.n_qubits, self.reps)
+                sv_list.append(Statevector(qc).data)
+            
+            V = np.array(sv_list)
+            K_exact = np.abs(V.conj() @ V.T)**2
+            K_exact = np.clip(K_exact, 0.0, 1.0)
+            
+            # Apply shot noise
+            rng = np.random.default_rng(self.seed + hash(tuple(theta)) % 10000)
+            K = rng.binomial(self.shots, K_exact) / self.shots
+            np.fill_diagonal(K, 1.0)
+            return K
+
+        # Aer simulator path
         K = np.zeros((n, n), dtype=float)
 
+        chunk_size = self.chunk_size
         circuits = []
         indices = []
+
+        def _run_chunk() -> None:
+            if not circuits:
+                return
+            t_circuits = transpile(circuits, self._backend, optimization_level=0)
+            job = self._backend.run(t_circuits, shots=self.shots)
+            counts_list = job.result().get_counts()
+            if not isinstance(counts_list, list):
+                counts_list = [counts_list]
+            zero_key = "0" * self.n_qubits
+            for count, (idx_i, idx_j) in zip(counts_list, indices):
+                val = count.get(zero_key, 0) / self.shots
+                K[idx_i, idx_j] = val
+                K[idx_j, idx_i] = val
+            circuits.clear()
+            indices.clear()
 
         for i in range(n):
             K[i, i] = 1.0  # exact fidelity diagonal
@@ -137,19 +178,11 @@ class TrainableKernel(QuantumKernel):
                 circuits.append(qc)
                 indices.append((i, j))
 
-        if circuits:
-            t_circuits = transpile(circuits, self._backend, optimization_level=0)
-            job = self._backend.run(t_circuits, shots=self.shots)
-            counts_list = job.result().get_counts()
+                if len(circuits) >= chunk_size:
+                    _run_chunk()
 
-            if not isinstance(counts_list, list):
-                counts_list = [counts_list]
-
-            zero_key = "0" * self.n_qubits
-            for count, (i, j) in zip(counts_list, indices):
-                val = count.get(zero_key, 0) / self.shots
-                K[i, j] = val
-                K[j, i] = val
+        if len(circuits) > 0:
+            _run_chunk()
 
         return K
 
@@ -172,6 +205,8 @@ class TrainableKernel(QuantumKernel):
         rng = np.random.default_rng(self.seed)
         theta0 = rng.uniform(-np.pi, np.pi, self._n_params)
 
+        from tqdm import tqdm
+
         with tqdm(
             total=self.max_iter,
             desc="  QKTA fit",
@@ -187,6 +222,7 @@ class TrainableKernel(QuantumKernel):
                 pbar.set_postfix(kta=f"{kta:.4f}", refresh=True)
                 return -kta
 
+            from scipy.optimize import minimize
             result = minimize(
                 neg_kta,
                 theta0,
@@ -206,9 +242,6 @@ class TrainableKernel(QuantumKernel):
     ) -> np.ndarray:
         """
         Compute the kernel matrix using the learned theta.
-
-        If Y is None, compute the symmetric self-kernel K(X, X).
-        Otherwise compute the rectangular kernel K(X, Y).
         """
         self._reset_stats()
         t0 = time.perf_counter()
@@ -218,34 +251,95 @@ class TrainableKernel(QuantumKernel):
         Y = X if Y is None else Y
 
         n, m = len(X), len(Y)
+
+        if self.backend_name == "statevector":
+            K = self._build_kernel_matrix_sv(X, Y, symmetric, n, m)
+        else:
+            K = self._build_kernel_matrix_aer(X, Y, symmetric, n, m)
+
+        if symmetric and self.enforce_psd:
+            K = self._project_to_psd(K)
+            np.fill_diagonal(K, 1.0)
+
+        self.stats.wall_clock_seconds = time.perf_counter() - t0
+        return K
+
+    def _build_kernel_matrix_sv(
+        self, X: np.ndarray, Y: np.ndarray, symmetric: bool, n: int, m: int
+    ) -> np.ndarray:
+        from tqdm import tqdm
+        from qiskit.quantum_info import Statevector
+
+        example_qc = _build_trainable_circuit(X[0], self._theta, self.n_qubits, self.reps)
+        res = analyze_circuit_resources(example_qc)
+        self.stats.total_depth = res["total_depth"]
+        self.stats.two_qubit_depth = res["two_qubit_depth"]
+        self.stats.total_gates = res["total_gates"]
+        self.stats.two_qubit_count = res["two_qubit_count"]
+        self.stats.one_qubit_count = res["one_qubit_count"]
+        self.stats.gate_breakdown = res["gate_breakdown"]
+
+        total_pairs = (n * (n + 1)) // 2 if symmetric else n * m
+        self.stats.total_shots = total_pairs * self.shots
+        self.stats.n_evaluations = total_pairs
+
+        def encode_dist(data: np.ndarray, desc: str) -> np.ndarray:
+            svs = []
+            for i in tqdm(range(len(data)), desc=desc, unit="sv", ncols=88, leave=False):
+                qc = _build_trainable_circuit(data[i], self._theta, self.n_qubits, self.reps)
+                svs.append(Statevector(qc).data)
+            return np.array(svs)
+
+        V_x = encode_dist(X, "  QKTA SV (X)")
+        V_y = V_x if symmetric else encode_dist(Y, "  QKTA SV (Y)")
+
+        K_exact = np.abs(V_x.conj() @ V_y.T)**2
+        K_exact = np.clip(K_exact, 0.0, 1.0)
+
+        rng = np.random.default_rng(self.seed)
+        K = rng.binomial(self.shots, K_exact) / self.shots
+
+        if symmetric:
+            np.fill_diagonal(K, 1.0)
+
+        return K
+
+    def _build_kernel_matrix_aer(
+        self, X: np.ndarray, Y: np.ndarray, symmetric: bool, n: int, m: int
+    ) -> np.ndarray:
+        from tqdm import tqdm
+
         K = np.zeros((n, m), dtype=float)
+
+        total_pairs = (n * (n + 1)) // 2 if symmetric else n * m
+        chunk_size = self.chunk_size
 
         circuits = []
         indices = []
 
-        for i in range(n):
-            start_j = i if symmetric else 0
-            for j in range(start_j, m):
-                if symmetric and i == j:
-                    K[i, i] = 1.0
-                    continue
+        self.stats.total_shots = 0
+        self.stats.n_evaluations = 0
 
-                qc = self._overlap_circuit(X[i], Y[j], self._theta)
-                circuits.append(qc)
-                indices.append((i, j))
+        pbar = tqdm(total=total_pairs, desc="  QKTA matrix", unit="pair", ncols=88, leave=False)
 
-        if circuits:
-            self.stats.total_shots = self.shots * len(circuits)
-            self.stats.n_evaluations = len(circuits)
+        def _run_chunk() -> None:
+            if not circuits:
+                return
 
-            # Analyze a representative overlap circuit
-            res = analyze_circuit_resources(circuits[0])
-            self.stats.total_depth = res["total_depth"]
-            self.stats.two_qubit_depth = res["two_qubit_depth"]
-            self.stats.total_gates = res["total_gates"]
-            self.stats.two_qubit_count = res["two_qubit_count"]
-            self.stats.one_qubit_count = res["one_qubit_count"]
-            self.stats.gate_breakdown = res["gate_breakdown"]
+            pbar.set_postfix_str("simulating...", refresh=True)
+
+            if self.stats.total_shots == 0:
+                example_qc = _build_trainable_circuit(X[0], self._theta, self.n_qubits, self.reps)
+                res = analyze_circuit_resources(example_qc)
+                self.stats.total_depth = res["total_depth"]
+                self.stats.two_qubit_depth = res["two_qubit_depth"]
+                self.stats.total_gates = res["total_gates"]
+                self.stats.two_qubit_count = res["two_qubit_count"]
+                self.stats.one_qubit_count = res["one_qubit_count"]
+                self.stats.gate_breakdown = res["gate_breakdown"]
+
+            self.stats.total_shots += self.shots * len(circuits)
+            self.stats.n_evaluations += len(circuits)
 
             t_circuits = transpile(circuits, self._backend, optimization_level=0)
             job = self._backend.run(t_circuits, shots=self.shots)
@@ -255,27 +349,37 @@ class TrainableKernel(QuantumKernel):
                 counts_list = [counts_list]
 
             zero_key = "0" * self.n_qubits
-            for count, (i, j) in zip(counts_list, indices):
+            for count, (idx_i, idx_j) in zip(counts_list, indices):
                 val = count.get(zero_key, 0) / self.shots
-                K[i, j] = val
-                if symmetric:
-                    K[j, i] = val
-        else:
-            # all diagonal case, e.g. n=1 symmetric
-            self.stats.total_shots = 0
-            self.stats.n_evaluations = 0
+                K[idx_i, idx_j] = val
+                if symmetric and idx_i != idx_j:
+                    K[idx_j, idx_i] = val
 
-            # Still record representative circuit resources if possible
-            example_qc = self._overlap_circuit(X[0], Y[0], self._theta)
-            res = analyze_circuit_resources(example_qc)
-            self.stats.total_depth = res["total_depth"]
-            self.stats.two_qubit_depth = res["two_qubit_depth"]
-            self.stats.total_gates = res["total_gates"]
-            self.stats.two_qubit_count = res["two_qubit_count"]
-            self.stats.one_qubit_count = res["one_qubit_count"]
-            self.stats.gate_breakdown = res["gate_breakdown"]
+            pbar.update(len(circuits))
+            pbar.set_postfix_str("", refresh=True)
+            circuits.clear()
+            indices.clear()
 
-        self.stats.wall_clock_seconds = time.perf_counter() - t0
+        for i in range(n):
+            start_j = i if symmetric else 0
+            for j in range(start_j, m):
+                if symmetric and i == j:
+                    K[i, i] = 1.0
+                    pbar.update(1)
+                    continue
+
+                qc = self._overlap_circuit(X[i], Y[j], self._theta)
+                circuits.append(qc)
+                indices.append((i, j))
+
+                if len(circuits) >= chunk_size:
+                    _run_chunk()
+
+        if len(circuits) > 0:
+            _run_chunk()
+            
+        pbar.close()
+
         return K
 
 if __name__ == "__main__":
@@ -299,6 +403,9 @@ if __name__ == "__main__":
         test_size=0.25,
         random_state=42,
     )
+
+    X_train = X_train[:, :2]
+    X_test = X_test[:, :2]
 
     print("X_train shape:", X_train.shape)
     print("X_test shape :", X_test.shape)

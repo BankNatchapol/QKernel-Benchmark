@@ -1,16 +1,14 @@
+from __future__ import annotations
+
 """
 Check by Bank
 2025-03-09
-"""
 
-"""
 BenchmarkRunner: orchestrates the full benchmark grid.
 
 Runs every combination of (kernel × dataset), fits the classifier,
 collects ML metrics plus quantum resource stats, and returns a DataFrame.
 """
-
-from __future__ import annotations
 
 import time
 from pathlib import Path
@@ -104,6 +102,9 @@ class BenchmarkRunner:
             if outer_pbar is not None:
                 outer_pbar.set_postfix_str(msg, refresh=True)
 
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import StandardScaler
+
         # Load data
         _set_desc("loading data")
         X_train, X_test, y_train, y_test = load_dataset(
@@ -113,11 +114,36 @@ class BenchmarkRunner:
             random_state=random_state,
         )
 
+        n_original_features = X_train.shape[1] if len(X_train.shape) > 1 else 1
+
+        # Reshape EnergyFlow (3D array) to 2D
+        if len(X_train.shape) == 3:
+            X_train = X_train.reshape(X_train.shape[0], -1)
+            X_test  = X_test.reshape(X_test.shape[0], -1)
+
+        # Apply PCA if features > n_qubits
+        if X_train.shape[1] > self.n_qubits:
+            _set_desc(f"PCA ({X_train.shape[1]} -> {self.n_qubits})")
+            scaler = StandardScaler()
+            X_train = scaler.fit_transform(X_train)
+            X_test = scaler.transform(X_test)
+            
+            pca = PCA(n_components=self.n_qubits, random_state=random_state)
+            X_train = pca.fit_transform(X_train)
+            X_test = pca.transform(X_test)
+
+        # Final MinMax Scaling to [0, pi] for quantum feature maps
+        from sklearn.preprocessing import MinMaxScaler
+        scaler_pi = MinMaxScaler(feature_range=(0, np.pi))
+        X_train = scaler_pi.fit_transform(X_train)
+        X_test = scaler_pi.transform(X_test)
+
         row: dict[str, Any] = {
             "kernel": kernel_name,
             "dataset": dataset_name,
             "n_train": len(X_train),
             "n_test": len(X_test),
+            "original_features": n_original_features,
         }
 
         with ResourceTracker() as tracker:
@@ -193,6 +219,8 @@ class BenchmarkRunner:
             unit="exp",
             ncols=88,
             colour="cyan",
+            position=0,
+            leave=True,
         ) as pbar:
             for dataset_name in self.dataset_names:
                 dataset_roc[dataset_name] = {}
@@ -249,7 +277,7 @@ class BenchmarkRunner:
         # ── Summary table ──────────────────────────────────────────────
         cols = [
             "kernel", "dataset", "accuracy", "f1", "roc_auc", 
-            "2q_count", "2q_depth", "total_depth", "1q_count", 
+            "n_qubits", "2q_count", "2q_depth", "total_depth", "1q_count", 
             "total_gates", "wall_clock_s"
         ]
         

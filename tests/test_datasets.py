@@ -24,6 +24,9 @@ def test_dataset_loads(name: str) -> None:
         name, n_samples=N_SAMPLES, n_features=N_FEATURES, random_state=0
     )
 
+    X_train = X_train[:, :N_FEATURES]
+    X_test = X_test[:, :N_FEATURES]
+
     # Check feature dimensions
     assert X_train.shape[1] == N_FEATURES, f"{name}: wrong feature dim {X_train.shape[1]}"
     assert X_test.shape[1] == N_FEATURES

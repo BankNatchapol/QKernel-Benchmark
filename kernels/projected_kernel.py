@@ -60,8 +60,10 @@ class ProjectedKernel(QuantumKernel):
         gamma: float = 1.0,
         shots: int = 1024,
         seed: int = 42,
+        chunk_size: int = 4096,
+        backend_name: str = "aer",
     ):
-        super().__init__(n_qubits=n_qubits, shots=shots, seed=seed)
+        super().__init__(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name)
         self.feature_map = feature_map or ZZMap(n_qubits=n_qubits, reps=2)
         self.gamma = gamma
 
@@ -141,10 +143,12 @@ class ProjectedKernel(QuantumKernel):
         symmetric = Y is None
         Y = X if Y is None else Y
 
+        from tqdm import tqdm
+
         # Compute projected feature vectors
-        X_bloch = np.array([self._bloch_vector(x) for x in X], dtype=float)
+        X_bloch = np.array([self._bloch_vector(x) for x in tqdm(X, desc="  PQK (X)", unit="smpl", ncols=88, leave=False)], dtype=float)
         Y_bloch = X_bloch if symmetric else np.array(
-            [self._bloch_vector(y) for y in Y], dtype=float
+            [self._bloch_vector(y) for y in tqdm(Y, desc="  PQK (Y)", unit="smpl", ncols=88, leave=False)], dtype=float
         )
 
         # In this statevector-based implementation:
