@@ -127,6 +127,7 @@ def _sample_rows_from_csv(
     header: int | None,
     random_state: int,
     chunksize: int = 100_000,
+    balanced: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Memory-safe random subsampling from a possibly huge CSV/CSV.GZ file.
@@ -134,6 +135,9 @@ def _sample_rows_from_csv(
     Assumes:
       - first column is label
       - remaining columns are features
+
+    If balanced=True, attempts to return exactly n_samples//2 from each class
+    before doing the final shuffle.
     """
     rng = np.random.default_rng(random_state)
 
@@ -142,12 +146,15 @@ def _sample_rows_from_csv(
     total_kept = 0
     total_seen = 0
 
+    # Oversample by 3× when balanced, so we have room to balance later
+    target = n_samples * 3 if balanced else n_samples
+
     reader = pd.read_csv(path, header=header, chunksize=chunksize)
 
     for chunk in reader:
         total_seen += len(chunk)
 
-        remaining_needed = n_samples - total_kept
+        remaining_needed = target - total_kept
         if remaining_needed <= 0:
             break
 
@@ -171,12 +178,59 @@ def _sample_rows_from_csv(
     X = np.vstack(xs)
     y = np.concatenate(ys)
 
-    if len(X) > n_samples:
+    if balanced:
+        X, y = _balanced_sample(X, y, n_samples, rng)
+    elif len(X) > n_samples:
         idx = rng.choice(len(X), size=n_samples, replace=False)
         X = X[idx]
         y = y[idx]
 
     return X, y
+
+
+def _balanced_sample(
+    X: np.ndarray,
+    y: np.ndarray,
+    n_samples: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Return exactly n_samples rows with a 50/50 class split.
+    If a class doesn't have enough samples, it takes as many as possible
+    and fills the rest from the other class.
+    """
+    unique_labels = np.unique(y)
+    half = n_samples // 2
+
+    chosen_X, chosen_y = [], []
+    for label in unique_labels:
+        mask = y == label
+        idx_class = np.where(mask)[0]
+        take = min(len(idx_class), half)
+        chosen = rng.choice(idx_class, size=take, replace=False)
+        chosen_X.append(X[chosen])
+        chosen_y.append(y[chosen])
+
+    X_bal = np.vstack(chosen_X)
+    y_bal = np.concatenate(chosen_y)
+
+    # If we're still short (one class is tiny), fill from what we have
+    if len(X_bal) < n_samples:
+        remaining = n_samples - len(X_bal)
+        already_used = set()
+        for i, label in enumerate(unique_labels):
+            already_used.update(np.where(y == label)[0][:min(half, np.sum(y == label))])
+        # Fall back: just shuffle and truncate
+        idx_all = rng.permutation(len(X_bal))
+        X_bal = X_bal[idx_all]
+        y_bal = y_bal[idx_all]
+    else:
+        # Shuffle the balanced set
+        idx_shuf = rng.permutation(len(X_bal))
+        X_bal = X_bal[idx_shuf[:n_samples]]
+        y_bal = y_bal[idx_shuf[:n_samples]]
+
+    return X_bal, y_bal
 
 
 # -----------------------------------------------------------------------
@@ -215,6 +269,7 @@ def _load_higgs(
         header=None,
         random_state=random_state,
         chunksize=chunksize,
+        balanced=True,  # Enforce 50/50 class balance
     )
 
 
@@ -277,8 +332,10 @@ def _load_hepmass_split(
 
     if n_train_samples is None:
         train_df = pd.read_csv(train_file)
-        y_train = train_df.iloc[:, 0].to_numpy()
-        X_train = train_df.iloc[:, 1:].to_numpy(dtype=np.float32, copy=False)
+        y_train_raw = train_df.iloc[:, 0].to_numpy()
+        X_train_raw = train_df.iloc[:, 1:].to_numpy(dtype=np.float32, copy=False)
+        rng_tr = np.random.default_rng(random_state)
+        X_train, y_train = _balanced_sample(X_train_raw, y_train_raw, len(y_train_raw), rng_tr)
     else:
         X_train, y_train = _sample_rows_from_csv(
             train_file,
@@ -286,12 +343,15 @@ def _load_hepmass_split(
             header=0,
             random_state=random_state,
             chunksize=chunksize,
+            balanced=True,
         )
 
     if n_test_samples is None:
         test_df = pd.read_csv(test_file)
-        y_test = test_df.iloc[:, 0].to_numpy()
-        X_test = test_df.iloc[:, 1:].to_numpy(dtype=np.float32, copy=False)
+        y_test_raw = test_df.iloc[:, 0].to_numpy()
+        X_test_raw = test_df.iloc[:, 1:].to_numpy(dtype=np.float32, copy=False)
+        rng_te = np.random.default_rng(random_state + 1)
+        X_test, y_test = _balanced_sample(X_test_raw, y_test_raw, len(y_test_raw), rng_te)
     else:
         X_test, y_test = _sample_rows_from_csv(
             test_file,
@@ -299,6 +359,7 @@ def _load_hepmass_split(
             header=0,
             random_state=random_state + 1,
             chunksize=chunksize,
+            balanced=True,
         )
 
     return X_train, X_test, y_train, y_test
@@ -461,8 +522,9 @@ def load_dataset(
         )
 
     elif name == "energyflow":
+        # Load extra samples so _balanced_sample has enough of each jet type
         X, y = _load_energyflow(
-            n_samples=n_samples,
+            n_samples=n_samples * 4,
             cache_dir=energyflow_cache_dir,
             generator=energyflow_generator,
             with_bc=energyflow_with_bc,
@@ -486,6 +548,11 @@ def load_dataset(
         idx = rng.choice(len(y), n_samples, replace=False)
         X = X[idx]
         y = y[idx]
+
+    # Enforce 50/50 balance for HEP datasets before splitting
+    if name in ("higgs", "energyflow"):
+        rng_bal = np.random.default_rng(random_state)
+        X, y = _balanced_sample(X, y, n_samples, rng_bal)
 
     _, counts = np.unique(y, return_counts=True)
     can_stratify = np.all(counts >= 2)

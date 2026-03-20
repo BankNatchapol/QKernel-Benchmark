@@ -45,10 +45,11 @@ def parse_args() -> argparse.Namespace:
 
 def build_kernels(n_qubits: int, shots: int, seed: int, chunk_size: int, backend_name: str) -> dict:
     return {
-        "FQK":    FidelityKernel(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name),
-        "PQK":    ProjectedKernel(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name),
-        "QKTA":   TrainableKernel(n_qubits=n_qubits, shots=shots, seed=seed, max_iter=30, chunk_size=chunk_size, backend_name=backend_name),
-        "Q-FLAIR": QFLAIRKernel(n_qubits=n_qubits, shots=shots, seed=seed, n_layers=3, chunk_size=chunk_size, backend_name=backend_name),
+        "FQK":       FidelityKernel(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name),
+        "PQK":       ProjectedKernel(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name),
+        "QKTA":      TrainableKernel(n_qubits=n_qubits, shots=shots, seed=seed, max_iter=30, chunk_size=chunk_size, backend_name=backend_name),
+        # "Q-FLAIR":   QFLAIRKernel(n_qubits=n_qubits, shots=shots, seed=seed, n_layers=3, chunk_size=chunk_size, backend_name=backend_name),
+        "SVM (RBF)": None,  # Classical baseline
     }
 
 

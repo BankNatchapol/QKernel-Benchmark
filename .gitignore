@@ -172,3 +172,4 @@ cython_debug/
 # Benchmark results
 results/
 !results/.gitkeep
+results_*/

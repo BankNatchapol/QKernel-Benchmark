@@ -240,10 +240,10 @@ def _apply_weight_data_gate(
             raise ValueError(
                 "alpha_override must be provided when applying a GateCandidate."
             )
-        alpha = gate.weight * float(x[gate.feature_idx])
+        alpha = gate.weight * x[gate.feature_idx]
         wires = gate.wires
     else:
-        alpha = float(alpha_override)
+        alpha = alpha_override
         wires = gate.wires
 
     if name == "rx":
@@ -320,8 +320,9 @@ class QFLAIRKernel(QuantumKernel):
         optimize_scalar_method: str = "bounded",
         chunk_size: int = 4096,
         backend_name: str = "aer",
+        backend: Any | None = None,
     ):
-        super().__init__(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name)
+        super().__init__(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name, backend=backend)
 
         self.n_layers = int(n_layers)
         self.alpha0 = float(alpha0)
@@ -331,30 +332,33 @@ class QFLAIRKernel(QuantumKernel):
         self.clip_reconstructed_kernel = bool(clip_reconstructed_kernel)
         self.optimize_scalar_method = str(optimize_scalar_method)
 
-        self._backend = AerSimulator(seed_simulator=seed)
+        self._backend = backend if backend is not None else AerSimulator(seed_simulator=seed)
         self._learned_gates: list[LearnedGate] = []
 
         if candidate_pool is None:
-            pool: list[GateCandidate] = []
-
-            # Single-qubit rotations on every qubit
-            for q in range(n_qubits):
-                pool.append(GateCandidate("rx", (q,)))
-                pool.append(GateCandidate("ry", (q,)))
-                pool.append(GateCandidate("rz", (q,)))
-
-            # Nearest-neighbor entangling two-qubit gates
-            for q in range(n_qubits - 1):
-                pool.append(GateCandidate("rxx", (q, q + 1)))
-                pool.append(GateCandidate("ryy", (q, q + 1)))
-                pool.append(GateCandidate("rzz", (q, q + 1)))
-
-            candidate_pool = pool
+            candidate_pool = self._generate_candidate_pool(n_qubits)
 
         for cand in candidate_pool:
             _validate_gate_candidate(cand)
 
         self.candidate_pool = list(candidate_pool)
+
+    def _generate_candidate_pool(self, n_qubits: int) -> list[GateCandidate]:
+        pool: list[GateCandidate] = []
+        for q in range(n_qubits):
+            pool.append(GateCandidate("rx", (q,)))
+            pool.append(GateCandidate("ry", (q,)))
+            pool.append(GateCandidate("rz", (q,)))
+        for q in range(n_qubits - 1):
+            pool.append(GateCandidate("rxx", (q, q + 1)))
+            pool.append(GateCandidate("ryy", (q, q + 1)))
+            pool.append(GateCandidate("rzz", (q, q + 1)))
+        return pool
+
+    @QuantumKernel.n_qubits.setter
+    def n_qubits(self, value: int):
+        self._n_qubits = value
+        self.candidate_pool = self._generate_candidate_pool(value)
 
     # -------------------------------------------------------------------------
     # Validation
@@ -1000,10 +1004,83 @@ class QFLAIRKernel(QuantumKernel):
 
         if self.backend_name == "statevector":
             K = self._build_kernel_matrix_sv(X, Y, symmetric, n, m)
+        elif self.backend_name == "ibm":
+            K = self._build_kernel_matrix_ibm(X, Y, symmetric, n, m)
         else:
             K = self._build_kernel_matrix_aer(X, Y, symmetric, n, m)
 
         self.stats.wall_clock_seconds = time.perf_counter() - t0
+        return K
+
+    def _build_kernel_matrix_ibm(
+        self, X: np.ndarray, Y: np.ndarray, symmetric: bool, n: int, m: int
+    ) -> np.ndarray:
+        """IBM Runtime inference path using SamplerV2 and transpilation."""
+        from tqdm import tqdm
+        from qiskit_ibm_runtime import SamplerV2 as Sampler
+        from qiskit.circuit import ParameterVector
+
+        K = np.zeros((n, m), dtype=float)
+        total_pairs = (n * (n + 1)) // 2 if symmetric else n * m
+        chunk_size = self.chunk_size
+
+        example_qc = self._build_feature_map(X[0], self._learned_gates)
+        res = analyze_circuit_resources(example_qc)
+        self.stats.total_depth = res["total_depth"]
+        self.stats.two_qubit_depth = res["two_qubit_depth"]
+        self.stats.total_gates = res["total_gates"]
+        self.stats.two_qubit_count = res["two_qubit_count"]
+        self.stats.one_qubit_count = res["one_qubit_count"]
+        self.stats.gate_breakdown = res["gate_breakdown"]
+
+        # Build template
+        x_sym = ParameterVector("x", self.n_qubits)
+        y_sym = ParameterVector("y", self.n_qubits)
+        phi_x = self._build_feature_map(x_sym, self._learned_gates)
+        phi_y = self._build_feature_map(y_sym, self._learned_gates)
+        qc = QuantumCircuit(self.n_qubits)
+        qc.compose(phi_x, inplace=True)
+        qc.compose(phi_y.inverse(), inplace=True)
+        qc.measure_all()
+
+        tqdm.write(f"  QFLAIR IBM: Transpiling template for {self._backend.name}...")
+        t_template = transpile(qc, self._backend, optimization_level=3)
+
+        x_binds = [{x_sym[k]: X[i, k] for k in range(self.n_qubits)} for i in range(n)]
+        y_binds = [{y_sym[k]: Y[j, k] for k in range(self.n_qubits)} for j in range(m)]
+
+        circuits, indices = [], []
+        sampler = Sampler(mode=self._backend)
+        pbar = tqdm(total=total_pairs, desc="  QFLAIR IBM", unit="pair", ncols=88, leave=False)
+
+        def _run_chunk() -> None:
+            if not circuits: return
+            pbar.set_postfix_str("submitting...", refresh=True)
+            self.stats.total_shots += self.shots * len(circuits)
+            self.stats.n_evaluations += len(circuits)
+            job = sampler.run(circuits, shots=self.shots)
+            res = job.result()
+            zero_key = "0" * self.n_qubits
+            for pub_idx, (idx_i, idx_j) in enumerate(indices):
+                counts = res[pub_idx].data.meas.get_counts()
+                val = counts.get(zero_key, 0) / self.shots
+                K[idx_i, idx_j] = val
+                if symmetric and idx_i != idx_j: K[idx_j, idx_i] = val
+            pbar.update(len(circuits))
+            pbar.set_postfix_str("", refresh=True)
+            circuits.clear(); indices.clear()
+
+        for i in range(n):
+            start_j = i if symmetric else 0
+            for j in range(start_j, m):
+                if symmetric and i == j:
+                    K[i, i] = 1.0; pbar.update(1); continue
+                binds = x_binds[i].copy(); binds.update(y_binds[j])
+                qc = t_template.assign_parameters(binds)
+                circuits.append(qc); indices.append((i, j))
+                if len(circuits) >= chunk_size: _run_chunk()
+        if circuits: _run_chunk()
+        pbar.close()
         return K
 
     def _build_kernel_matrix_sv(

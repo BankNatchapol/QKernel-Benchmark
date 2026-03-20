@@ -7,6 +7,7 @@ Checked by Bank
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -26,6 +27,15 @@ class ResourceStats:
     two_qubit_count: int = 0
     one_qubit_count: int = 0
     gate_breakdown: str = ""
+    
+    def update_stats(self, results: dict[str, Any]) -> None:
+        """Update stats from analyze_circuit_resources output."""
+        self.total_depth = results.get("total_depth", self.total_depth)
+        self.two_qubit_depth = results.get("two_qubit_depth", self.two_qubit_depth)
+        self.total_gates = results.get("total_gates", self.total_gates)
+        self.two_qubit_count = results.get("two_qubit_count", self.two_qubit_count)
+        self.one_qubit_count = results.get("one_qubit_count", self.one_qubit_count)
+        self.gate_breakdown = results.get("gate_breakdown", self.gate_breakdown)
 
 
 class QuantumKernel(ABC):
@@ -38,13 +48,22 @@ class QuantumKernel(ABC):
     ``build_kernel_matrix``.
     """
 
-    def __init__(self, n_qubits: int, shots: int = 1024, seed: int = 42, chunk_size: int = 4096, backend_name: str = "aer"):
-        self.n_qubits = n_qubits
+    def __init__(self, n_qubits: int, shots: int = 1024, seed: int = 42, chunk_size: int = 4096, backend_name: str = "aer", backend: Any | None = None):
+        self._n_qubits = n_qubits
         self.shots = shots
         self.seed = seed
         self.chunk_size = chunk_size
         self.backend_name = backend_name
+        self.backend = backend
         self.stats = ResourceStats(n_qubits=n_qubits)
+
+    @property
+    def n_qubits(self) -> int:
+        return self._n_qubits
+
+    @n_qubits.setter
+    def n_qubits(self, value: int):
+        self._n_qubits = value
 
     def _reset_stats(self) -> None:
         """Reset resource counters before a new kernel computation."""

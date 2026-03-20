@@ -33,7 +33,7 @@ KERNEL_REGISTRY = {
     "fqk": lambda n_qubits, shots, seed, chunk_size, backend_name: FidelityKernel(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name),
     "pqk": lambda n_qubits, shots, seed, chunk_size, backend_name: ProjectedKernel(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name),
     "qkta": lambda n_qubits, shots, seed, chunk_size, backend_name: TrainableKernel(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name),
-    "qflair": lambda n_qubits, shots, seed, chunk_size, backend_name: QFLAIRKernel(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name),
+    # "qflair": lambda n_qubits, shots, seed, chunk_size, backend_name: QFLAIRKernel(n_qubits=n_qubits, shots=shots, seed=seed, chunk_size=chunk_size, backend_name=backend_name),
 }
 
 

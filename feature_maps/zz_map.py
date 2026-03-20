@@ -42,6 +42,11 @@ class ZZMap(FeatureMap):
         super().__init__(n_qubits, reps)
         self._template = zz_feature_map(feature_dimension=n_qubits, reps=reps)
 
+    @FeatureMap.n_qubits.setter
+    def n_qubits(self, value: int):
+        self._n_qubits = value
+        self._template = zz_feature_map(feature_dimension=value, reps=self._reps)
+
     def build(self, x: np.ndarray) -> QuantumCircuit:
         params = self._template.parameters
         values = [x[i % len(x)] for i in range(len(params))]

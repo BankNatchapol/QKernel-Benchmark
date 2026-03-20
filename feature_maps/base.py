@@ -22,6 +22,10 @@ class FeatureMap(ABC):
     def n_qubits(self) -> int:
         return self._n_qubits
 
+    @n_qubits.setter
+    def n_qubits(self, value: int):
+        self._n_qubits = value
+
     @property
     def reps(self) -> int:
         return self._reps

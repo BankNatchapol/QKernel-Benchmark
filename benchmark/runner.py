@@ -11,6 +11,7 @@ collects ML metrics plus quantum resource stats, and returns a DataFrame.
 """
 
 import time
+import json
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from kernels.base import QuantumKernel
 from kernels.trainable_kernel import TrainableKernel
 from kernels.qflair_kernel import QFLAIRKernel
 from classifiers.qsvm import QSVM
+from classifiers.classical_svm import ClassicalSVM
 from benchmark.metrics import (
     compute_all_metrics,
     ResourceTracker,
@@ -142,11 +144,12 @@ class BenchmarkRunner:
                 f"but n_qubits={self.n_qubits} was requested. "
                 f"Using n_qubits={actual_features} for this run."
             )
-            # Update kernel and feature map n_qubits in-place
-            kernel.n_qubits = actual_features
-            kernel.stats.n_qubits = actual_features
+        # Sync kernel and stats with effective qubit count for this dataset
+        if kernel is not None:
+            kernel.n_qubits = effective_n_qubits
+            kernel.stats.n_qubits = effective_n_qubits
             if hasattr(kernel, "feature_map"):
-                kernel.feature_map.n_qubits = actual_features
+                kernel.feature_map.n_qubits = effective_n_qubits
 
         # Final MinMax Scaling to [0, pi] for quantum feature maps
         from sklearn.preprocessing import MinMaxScaler
@@ -163,27 +166,43 @@ class BenchmarkRunner:
         }
 
         with ResourceTracker() as tracker:
-            # --- Optional training step (QKTA / Q-FLAIR) ---
-            if isinstance(kernel, (TrainableKernel, QFLAIRKernel)):
-                _set_desc("training kernel params")
-                kernel.fit(X_train, y_train)
+            # --- Quantum Kernels ---
+            if not ("SVM (RBF)" in kernel_name):
+                # --- Optional training step (QKTA / Q-FLAIR) ---
+                if isinstance(kernel, (TrainableKernel, QFLAIRKernel)):
+                    _set_desc("training kernel params")
+                    kernel.fit(X_train, y_train)
 
-            # --- Kernel matrices ---
-            _set_desc(f"K_train ({len(X_train)}×{len(X_train)})")
-            K_train = kernel.build_kernel_matrix(X_train)
+                # --- Kernel matrices ---
+                _set_desc(f"K_train ({len(X_train)}×{len(X_train)})")
+                K_train = kernel.build_kernel_matrix(X_train)
 
-            _set_desc(f"K_test  ({len(X_test)}×{len(X_train)})")
-            K_test = kernel.build_kernel_matrix(X_test, X_train)
+                _set_desc(f"K_test  ({len(X_test)}×{len(X_train)})")
+                K_test = kernel.build_kernel_matrix(X_test, X_train)
+            else:
+                K_train = None
+                K_test = None
 
             # --- QSVM ---
-            _set_desc("fitting QSVM")
-            clf = QSVM(C=self.C)
-            clf.fit(K_train, y_train)
-            y_pred = clf.predict(K_test)
-            try:
-                y_score = clf.predict_proba(K_test)[:, 1]
-            except Exception:
-                y_score = None
+            _set_desc(f"fitting {kernel_name}")
+            if "SVM (RBF)" in kernel_name:
+                # Classical SVM baseline
+                clf = ClassicalSVM(C=self.C)
+                clf.fit(X_train, y_train)
+                y_pred = clf.predict(X_test)
+                try:
+                    y_score = clf.predict_proba(X_test)[:, 1]
+                except Exception:
+                    y_score = None
+            else:
+                # Quantum Kernels
+                clf = QSVM(C=self.C)
+                clf.fit(K_train, y_train)
+                y_pred = clf.predict(K_test)
+                try:
+                    y_score = clf.predict_proba(K_test)[:, 1]
+                except Exception:
+                    y_score = None
 
         row["wall_clock_s"] = tracker.elapsed
 
@@ -191,16 +210,27 @@ class BenchmarkRunner:
         ml = compute_all_metrics(y_test, y_pred, y_score)
         row.update(ml)
 
-        # --- Quantum resource metrics ---
-        row["n_qubits"]        = kernel.stats.n_qubits
-        row["total_depth"]     = kernel.stats.total_depth
-        row["2q_depth"]        = kernel.stats.two_qubit_depth
-        row["total_gates"]     = kernel.stats.total_gates
-        row["2q_count"]        = kernel.stats.two_qubit_count
-        row["1q_count"]        = kernel.stats.one_qubit_count
-        row["gate_breakdown"]  = kernel.stats.gate_breakdown
-        row["total_shots"]     = kernel.stats.total_shots
-        row["n_evaluations"]   = kernel.stats.n_evaluations
+        if not ("SVM (RBF)" in kernel_name):
+            # --- Quantum resource metrics ---
+            row["n_qubits"]        = kernel.stats.n_qubits
+            row["total_depth"]     = kernel.stats.total_depth
+            row["2q_depth"]        = kernel.stats.two_qubit_depth
+            row["total_gates"]     = kernel.stats.total_gates
+            row["2q_count"]        = kernel.stats.two_qubit_count
+            row["1q_count"]        = kernel.stats.one_qubit_count
+            row["gate_breakdown"]  = kernel.stats.gate_breakdown
+            row["total_shots"]     = kernel.stats.total_shots
+            row["n_evaluations"]   = kernel.stats.n_evaluations
+        else:
+            row["n_qubits"]        = X_train.shape[1]
+            row["total_depth"]     = 0
+            row["2q_depth"]        = 0
+            row["total_gates"]     = 0
+            row["2q_count"]        = 0
+            row["1q_count"]        = 0
+            row["gate_breakdown"]  = "N/A"
+            row["total_shots"]     = 0
+            row["n_evaluations"]   = 0
 
         # --- Confusion matrix ---
         cm_path = self.results_dir / "plots" / f"cm_{kernel_name}_{dataset_name}.png"
@@ -285,6 +315,24 @@ class BenchmarkRunner:
                         save_path=roc_path,
                         title=f"ROC Curves — {dataset_name}",
                     )
+
+        # ── Save raw ROC data for future reproduction ──────────────────
+        roc_json_path = self.results_dir / "roc_data.json"
+        
+        # Convert numpy arrays to lists for JSON serialization
+        serializable_roc = {}
+        for ds_name, kernels_data in dataset_roc.items():
+            serializable_roc[ds_name] = {}
+            for k_name, data in kernels_data.items():
+                serializable_roc[ds_name][k_name] = {
+                    "y_true":  data["y_true"].tolist(),
+                    "y_score": data["y_score"].tolist() if data["y_score"] is not None else None
+                }
+        
+        with open(roc_json_path, "w") as f:
+            json.dump(serializable_roc, f, indent=2)
+        
+        tqdm.write(f"  {_ok('✓')} Saved raw ROC data → {roc_json_path}")
 
         df = pd.DataFrame(records)
         csv_path = self.results_dir / "benchmark_results.csv"
